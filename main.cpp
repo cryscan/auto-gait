@@ -53,13 +53,13 @@ struct Plant {
 };
 
 struct StateControl {
-    Matrix3dual matrix;
-    Block<Matrix3dual, 3, 1, true> r, r_dt, theta, theta_dt, p, p_dt, f;
+    Matrix3Xdual matrix;
+    Block<Matrix3Xdual, 3, 1, true> r, r_dt, theta, theta_dt, p, p_dt, f;
 
     const Plant& plant;
 
     template<typename T>
-    explicit StateControl(const T& matrix, const Plant& plant);
+    explicit StateControl(const T& t, const Plant& plant);
 
     [[nodiscard]] Vector3dual angular_velocity() const;
     [[nodiscard]] auto dynamics() const;
@@ -72,8 +72,8 @@ struct StateControl {
 };
 
 template<typename T>
-StateControl::StateControl(const T& _matrix, const Plant& plant) :
-        matrix(_matrix),
+StateControl::StateControl(const T& t, const Plant& plant) :
+        matrix(Map<const Matrix<double, 3, state_dims / 3>>(t.data())),
         r(matrix.col(0)),
         r_dt(matrix.col(1)),
         theta(matrix.col(2)),
@@ -89,11 +89,12 @@ Vector3dual StateControl::angular_velocity() const {
     auto sin_theta_y = sin(theta.y());
     auto cos_theta_z = cos(theta.z());
     auto sin_theta_z = sin(theta.z());
-    auto transform = (Matrix3dual()
+    Matrix3dual transform;
+    transform
             <<
             cos_theta_y * cos_theta_z, -sin_theta_z, 0,
             cos_theta_y * sin_theta_z, cos_theta_z, 0,
-            -sin_theta_y, 0, 1).finished();
+            -sin_theta_y, 0, 1;
     return transform * theta_dt;
 }
 
@@ -123,78 +124,102 @@ Vector3dual StateControl::box() const {
     return (rotation * (p - r) - plant.p).cwiseAbs() - plant.b;
 }
 
-template<typename T>
-auto chip_tensor(const T& tensor, int index) {
-    TensorRef<Tensor<const double, 2>> chip = tensor.chip(index, 0);
-    Map<const MatrixXd> matrix(chip.data(), chip.dimension(1), chip.dimension(2));
-    return matrix;
-}
+class Collocation {
+    const Plant& plant;
 
-void collocation(unsigned output_dims,
-                 double* output,
-                 unsigned input_dims,
-                 const double* input,
-                 double* grad,
-                 void* data) {
-    auto& plant = *reinterpret_cast<Plant*>(data);
+    static auto func(const StateControl& current, const StateControl& next) {
+        auto delta = next.state() - current.state();
+        auto sum = next.dynamics() + current.dynamics();
+        return delta - 0.5 * delta_seconds * sum;
+    }
 
-    auto horizon = input_dims / state_dims;
-    assert(output_dims / dynamics_dims == horizon - 1);
+public:
+    static constexpr unsigned output_dims = dynamics_dims;
+    static constexpr unsigned input_dims = 2 * state_dims;
 
-    TensorMap<Tensor<const double, 3>> input_tensor(input, horizon, 3, state_dims / 3);
-    Map<MatrixXd> output_matrix(output, dynamics_dims, output_dims / dynamics_dims);
-    Map<MatrixXd> grad_matrix(grad, output_dims, input_dims);
+    explicit Collocation(const Plant& plant) : plant{plant} {}
 
-    for (int i = 0; i < horizon - 1; ++i) {
-        StateControl current(chip_tensor(input_tensor, i), plant);
-        StateControl next(chip_tensor(input_tensor, i + 1), plant);
-
-        auto func = [&] {
-            auto delta = next.state() - current.state();
-            auto sum = next.dynamics() + current.dynamics();
-            return delta - 0.5 * delta_seconds * sum;
-        };
+    template<typename Input, typename Output, typename Grad>
+    void operator()(unsigned index, const Input& input, Output& output, Grad& grad) {
+        StateControl current(input.col(index), plant);
+        StateControl next(input.col(index + 1), plant);
 
         VectorXdual output_dual;
-        if (grad != nullptr) {
-            constexpr auto dims = state_dims * 2;
-            auto start_row = dynamics_dims * i;
-            auto start_col = state_dims * i;
-            auto block = grad_matrix.block<dynamics_dims, dims>(start_row, start_col);
-            block << jacobian(func, wrt(current.param(), next.param()), at(), output_dual);
-        } else output_dual = func();
-        output_matrix.col(i) << output_dual.cast<double>();
+        auto start_row = index * output_dims;
+        auto start_col = index * state_dims;
+        auto block = grad.template block<output_dims, input_dims>(start_row, start_col);
+        block << jacobian(func, wrt(current.param(), next.param()), at(current, next), output_dual);
+        output << output_dual.cast<double>();
     }
-}
 
-void joint_limit(unsigned output_dims,
-                 double* output,
-                 unsigned input_dims,
-                 const double* input,
-                 double* grad,
-                 void* data) {
+    template<typename Input, typename Output>
+    void operator()(unsigned index, const Input& input, Output& output) {
+        StateControl current(input.col(index), plant);
+        StateControl next(input.col(index + 1), plant);
+        auto output_dual = func(current, next);
+        output << output_dual.cast<double>();
+    }
+};
+
+class JointLimit {
+    const Plant& plant;
+
+public:
+    static constexpr unsigned output_dims = 3;
+
+    explicit JointLimit(const Plant& plant) : plant{plant} {}
+
+    template<typename Input, typename Output, typename Grad>
+    void operator()(unsigned index, const Input& input, Output& output, Grad& grad) {
+        StateControl state_control(input.col(index), plant);
+        auto func = [&state_control] { return state_control.box(); };
+
+        VectorXdual output_dual;
+        auto start_row = index * output_dims;
+        auto start_col = index * state_dims;
+        auto block = grad.template block<output_dims, state_dims>(start_row, start_col);
+        block << jacobian(func, wrt(state_control.param()), at(), output_dual);
+        output << output_dual.cast<double>();
+    }
+
+    template<typename Input, typename Output>
+    void operator()(unsigned index, const Input& input, Output& output) {
+        StateControl state_control(input.col(index), plant);
+        auto output_dual = state_control.box();
+        output << output_dual.cast<double>();
+    }
+};
+
+template<typename Func>
+void
+wrapper(unsigned output_dims, double* output, unsigned input_dims, const double* input, double* grad, void* data) {
     auto& plant = *reinterpret_cast<Plant*>(data);
 
-    auto horizon = input_dims / state_dims;
-    assert(output_dims / 3 == horizon);
+    constexpr auto func_dims = Func::output_dims;
+    auto horizon = output_dims / func_dims;
 
-    TensorMap<Tensor<const double, 3>> input_tensor(input, horizon, 3, state_dims / 3);
-    Map<MatrixXd> output_matrix(output, 3, output_dims / 3);
+    Map<const MatrixXd> input_matrix(input, state_dims, input_dims / state_dims);
+    Map<MatrixXd> output_matrix(output, func_dims, horizon);
     Map<MatrixXd> grad_matrix(grad, output_dims, input_dims);
 
-    for (int i = 0; i < horizon; ++i) {
-        StateControl state_control(chip_tensor(input_tensor, i), plant);
-        auto func = [&] { return state_control.box(); };
+    for (unsigned i = 0; i < horizon; ++i) {
+        auto output_block = output_matrix.col(i);
+        auto grad_block = grad_matrix.middleRows<func_dims>(i * func_dims);
+        Func func(plant);
 
-        Vector3dual output_dual;
-        if (grad != nullptr) {
-            auto block = grad_matrix.block<3, state_dims>(3 * i, state_dims * i);
-            block << jacobian(func, wrt(state_control.param()), at(), output_dual);
-        } else output_dual = func();
-        output_matrix.col(i) << output_dual.cast<double>();
+        if (grad != nullptr)func(i, input_matrix, output_block, grad_block);
+        else func(i, input_matrix, output_block);
     }
 }
 
 int main() {
+    Plant plant;
+
+    unsigned horizon = 40;
+    std::vector<double> tol(state_dims * horizon, 0.1);
+    nlopt::opt opt(nlopt::algorithm::LD_SLSQP, state_dims * horizon);
+    opt.add_equality_mconstraint(wrapper<Collocation>, &plant, tol);
+    opt.add_inequality_mconstraint(wrapper<JointLimit>, &plant, tol);
+
     return 0;
 }
