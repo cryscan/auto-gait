@@ -10,6 +10,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <unsupported/Eigen/CXX11/Tensor>
+#include <unsupported/Eigen/EulerAngles>
 #include <autodiff/forward.hpp>
 #include <autodiff/forward/eigen.hpp>
 
@@ -21,11 +22,12 @@ using Eigen::MatrixXd;
 using Eigen::Matrix3d;
 using Eigen::Matrix3Xd;
 using Eigen::Map;
+using Eigen::Block;
 using Eigen::Tensor;
 using Eigen::TensorMap;
 using Eigen::TensorRef;
-using Eigen::sin;
-using Eigen::cos;
+using Eigen::EulerAngles;
+using Eigen::EulerSystem;
 using autodiff::dual;
 using autodiff::Vector3dual;
 using autodiff::VectorXdual;
@@ -35,6 +37,8 @@ using autodiff::forward::jacobian;
 using autodiff::forward::wrt;
 using autodiff::forward::at;
 
+using EulerAnglesZYXdual = EulerAngles<dual, EulerSystem<Eigen::EULER_Z, Eigen::EULER_Y, Eigen::EULER_X>>;
+
 constexpr double delta_seconds = 0.05;
 
 constexpr int state_dims = 21;
@@ -43,10 +47,15 @@ constexpr int dynamics_dims = 12;
 struct Plant {
     double mass = 1.0;
     Matrix3d inertia = Matrix3d::Identity();
+
+    Vector3d p = Vector3d(0.0, 0.0, -1.0);
+    Vector3d b = Vector3d(1.0, 1.0, 0.5);
 };
 
 struct StateControl {
     Matrix3dual matrix;
+    Block<Matrix3dual, 3, 1, true> r, r_dt, theta, theta_dt, p, p_dt, f;
+
     const Plant& plant;
 
     template<typename T>
@@ -56,39 +65,40 @@ struct StateControl {
     [[nodiscard]] auto dynamics() const;
     [[nodiscard]] auto state() const;
 
+    [[nodiscard]] Vector3dual box() const;
+
     [[nodiscard]] auto param() const;
     auto param();
 };
 
 template<typename T>
-StateControl::StateControl(const T& matrix, const Plant& plant) :
-        matrix(matrix),
+StateControl::StateControl(const T& _matrix, const Plant& plant) :
+        matrix(_matrix),
+        r(matrix.col(0)),
+        r_dt(matrix.col(1)),
+        theta(matrix.col(2)),
+        theta_dt(matrix.col(3)),
+        p(matrix.col(4)),
+        p_dt(matrix.col(5)),
+        f(matrix.col(6)),
         plant{plant} {
 }
 
 Vector3dual StateControl::angular_velocity() const {
-    auto theta = matrix.col(2);
-    auto theta_dt = matrix.col(3);
-
     auto cos_theta_y = cos(theta.y());
     auto sin_theta_y = sin(theta.y());
     auto cos_theta_z = cos(theta.z());
     auto sin_theta_z = sin(theta.z());
-    Matrix3dual transform;
-    transform << cos_theta_y * cos_theta_z, -sin_theta_z, 0,
+    auto transform = (Matrix3dual()
+            <<
+            cos_theta_y * cos_theta_z, -sin_theta_z, 0,
             cos_theta_y * sin_theta_z, cos_theta_z, 0,
-            -sin_theta_y, 0, 1;
+            -sin_theta_y, 0, 1).finished();
     return transform * theta_dt;
 }
 
 auto StateControl::dynamics() const {
-    auto r = matrix.col(0);
-    auto r_dt = matrix.col(1);
-    auto p = matrix.col(4);
-    auto p_dt = matrix.col(5);
-    auto f = matrix.col(6);
-
-    const Vector3d gravity(0, 9.8, 0);
+    const Vector3d gravity(0, 0, 9.8);
     auto linear_acc = f - plant.mass * gravity;
     auto angular_vel = angular_velocity();
     auto angular_acc = f.cross(r - p) - angular_vel.cross(plant.inertia * angular_vel);
@@ -96,10 +106,7 @@ auto StateControl::dynamics() const {
 }
 
 auto StateControl::state() const {
-    auto r = matrix.col(0);
-    auto r_dt = matrix.col(1);
     auto angular_vel = angular_velocity();
-    auto p = matrix.col(4);
     return (Matrix<dual, dynamics_dims, 1>() << r, r_dt, angular_vel, p).finished();
 }
 
@@ -109,6 +116,11 @@ auto StateControl::param() const {
 
 auto StateControl::param() {
     return Map<Matrix<dual, state_dims, 1>>(matrix.data());
+}
+
+Vector3dual StateControl::box() const {
+    EulerAnglesZYXdual rotation(theta.z(), theta.y(), theta.x());
+    return (rotation * (p - r) - plant.p).cwiseAbs() - plant.b;
 }
 
 template<typename T>
@@ -127,8 +139,10 @@ void collocation(unsigned output_dims,
     auto& plant = *reinterpret_cast<Plant*>(data);
 
     auto horizon = input_dims / state_dims;
+    assert(output_dims / dynamics_dims == horizon - 1);
+
     TensorMap<Tensor<const double, 3>> input_tensor(input, horizon, 3, state_dims / 3);
-    Map<MatrixXd> output_matrix(output, output_dims / dynamics_dims, dynamics_dims);
+    Map<MatrixXd> output_matrix(output, dynamics_dims, output_dims / dynamics_dims);
     Map<MatrixXd> grad_matrix(grad, output_dims, input_dims);
 
     for (int i = 0; i < horizon - 1; ++i) {
@@ -148,6 +162,34 @@ void collocation(unsigned output_dims,
             auto start_col = state_dims * i;
             auto block = grad_matrix.block<dynamics_dims, dims>(start_row, start_col);
             block << jacobian(func, wrt(current.param(), next.param()), at(), output_dual);
+        } else output_dual = func();
+        output_matrix.col(i) << output_dual.cast<double>();
+    }
+}
+
+void joint_limit(unsigned output_dims,
+                 double* output,
+                 unsigned input_dims,
+                 const double* input,
+                 double* grad,
+                 void* data) {
+    auto& plant = *reinterpret_cast<Plant*>(data);
+
+    auto horizon = input_dims / state_dims;
+    assert(output_dims / 3 == horizon);
+
+    TensorMap<Tensor<const double, 3>> input_tensor(input, horizon, 3, state_dims / 3);
+    Map<MatrixXd> output_matrix(output, 3, output_dims / 3);
+    Map<MatrixXd> grad_matrix(grad, output_dims, input_dims);
+
+    for (int i = 0; i < horizon; ++i) {
+        StateControl state_control(chip_tensor(input_tensor, i), plant);
+        auto func = [&] { return state_control.box(); };
+
+        Vector3dual output_dual;
+        if (grad != nullptr) {
+            auto block = grad_matrix.block<3, state_dims>(3 * i, state_dims * i);
+            block << jacobian(func, wrt(state_control.param()), at(), output_dual);
         } else output_dual = func();
         output_matrix.col(i) << output_dual.cast<double>();
     }
