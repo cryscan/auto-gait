@@ -9,7 +9,6 @@
 #include <nlopt.hpp>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
-#include <unsupported/Eigen/CXX11/Tensor>
 #include <unsupported/Eigen/EulerAngles>
 #include <autodiff/forward.hpp>
 #include <autodiff/forward/eigen.hpp>
@@ -23,9 +22,6 @@ using Eigen::Matrix3d;
 using Eigen::Matrix3Xd;
 using Eigen::Map;
 using Eigen::Block;
-using Eigen::Tensor;
-using Eigen::TensorMap;
-using Eigen::TensorRef;
 using Eigen::EulerAngles;
 using Eigen::EulerSystem;
 using autodiff::dual;
@@ -33,6 +29,7 @@ using autodiff::Vector3dual;
 using autodiff::VectorXdual;
 using autodiff::Matrix3dual;
 using autodiff::Matrix3Xdual;
+using autodiff::forward::gradient;
 using autodiff::forward::jacobian;
 using autodiff::forward::wrt;
 using autodiff::forward::at;
@@ -50,6 +47,8 @@ struct Plant {
 
     Vector3d p = Vector3d(0.0, 0.0, -1.0);
     Vector3d b = Vector3d(1.0, 1.0, 0.5);
+
+    double ground_height = 0;
 };
 
 struct StateControl {
@@ -135,7 +134,7 @@ class Collocation {
 
 public:
     static constexpr unsigned output_dims = dynamics_dims;
-    static constexpr unsigned input_dims = 2 * state_dims;
+    static constexpr unsigned frames = 2;
 
     explicit Collocation(const Plant& plant) : plant{plant} {}
 
@@ -145,10 +144,7 @@ public:
         StateControl next(input.col(index + 1), plant);
 
         VectorXdual output_dual;
-        auto start_row = index * output_dims;
-        auto start_col = index * state_dims;
-        auto block = grad.template block<output_dims, input_dims>(start_row, start_col);
-        block << jacobian(func, wrt(current.param(), next.param()), at(current, next), output_dual);
+        grad << jacobian(func, wrt(current.param(), next.param()), at(current, next), output_dual);
         output << output_dual.cast<double>();
     }
 
@@ -166,6 +162,7 @@ class JointLimit {
 
 public:
     static constexpr unsigned output_dims = 3;
+    static constexpr unsigned frames = 1;
 
     explicit JointLimit(const Plant& plant) : plant{plant} {}
 
@@ -175,10 +172,7 @@ public:
         auto func = [&state_control] { return state_control.box(); };
 
         VectorXdual output_dual;
-        auto start_row = index * output_dims;
-        auto start_col = index * state_dims;
-        auto block = grad.template block<output_dims, state_dims>(start_row, start_col);
-        block << jacobian(func, wrt(state_control.param()), at(), output_dual);
+        grad << jacobian(func, wrt(state_control.param()), at(), output_dual);
         output << output_dual.cast<double>();
     }
 
@@ -190,25 +184,56 @@ public:
     }
 };
 
+class Ground {
+    const Plant& plant;
+
+public:
+    static constexpr unsigned output_dims = 1;
+    static constexpr unsigned frames = 1;
+
+    explicit Ground(const Plant& plant) : plant{plant} {}
+
+    template<typename Input, typename Output, typename Grad>
+    void operator()(unsigned index, const Input& input, Output& output, Grad& grad) {
+        StateControl state_control(input.col(index), plant);
+        auto func = [&state_control, this] { return plant.ground_height - state_control.p.z(); };
+
+        dual output_dual;
+        grad << gradient(func, wrt(state_control.param()), at(), output_dual);
+        output << static_cast<double>(output_dual);
+    }
+
+    template<typename Input, typename Output>
+    void operator()(unsigned index, const Input& input, Output& output) {
+        StateControl state_control(input.col(index), plant);
+        dual output_dual = plant.ground_height - state_control.p.z();
+        output << static_cast<double>(output_dual);
+    }
+};
+
 template<typename Func>
 void
 wrapper(unsigned output_dims, double* output, unsigned input_dims, const double* input, double* grad, void* data) {
     auto& plant = *reinterpret_cast<Plant*>(data);
 
-    constexpr auto func_dims = Func::output_dims;
-    auto horizon = output_dims / func_dims;
+    constexpr auto func_output_dims = Func::output_dims;
+    auto horizon = output_dims / func_output_dims;
 
     Map<const MatrixXd> input_matrix(input, state_dims, input_dims / state_dims);
-    Map<MatrixXd> output_matrix(output, func_dims, horizon);
+    Map<MatrixXd> output_matrix(output, func_output_dims, horizon);
     Map<MatrixXd> grad_matrix(grad, output_dims, input_dims);
 
     for (unsigned i = 0; i < horizon; ++i) {
         auto output_block = output_matrix.col(i);
-        auto grad_block = grad_matrix.middleRows<func_dims>(i * func_dims);
         Func func(plant);
 
-        if (grad != nullptr)func(i, input_matrix, output_block, grad_block);
-        else func(i, input_matrix, output_block);
+        if (grad != nullptr) {
+            constexpr auto func_input_dims = Func::frames * state_dims;
+            auto start_row = i * output_dims;
+            auto start_col = i * state_dims;
+            auto block = grad_matrix.block<func_output_dims, func_input_dims>(start_row, start_col);
+            func(i, input_matrix, output_block, block);
+        } else func(i, input_matrix, output_block);
     }
 }
 
@@ -220,6 +245,7 @@ int main() {
     nlopt::opt opt(nlopt::algorithm::LD_SLSQP, state_dims * horizon);
     opt.add_equality_mconstraint(wrapper<Collocation>, &plant, tol);
     opt.add_inequality_mconstraint(wrapper<JointLimit>, &plant, tol);
+    opt.add_inequality_mconstraint(wrapper<Ground>, &plant, tol);
 
     return 0;
 }
