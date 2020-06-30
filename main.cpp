@@ -42,6 +42,7 @@ constexpr int state_dims = 21;
 constexpr int dynamics_dims = 12;
 
 struct Plant {
+    Vector3d gravity = Vector3d(0.0, 0.0, -9.8);
     double mass = 1.0;
     Matrix3d inertia = Matrix3d::Identity();
 
@@ -49,6 +50,8 @@ struct Plant {
     Vector3d b = Vector3d(1.0, 1.0, 0.5);
 
     double ground_height = 0;
+    Vector3d ground_normal = Vector3d(0.0, 0.0, 1.0);
+    double friction = 0.707;
 };
 
 struct StateControl {
@@ -65,6 +68,7 @@ struct StateControl {
     [[nodiscard]] auto state() const;
 
     [[nodiscard]] Vector3dual box() const;
+    dual contact_product() const;
 
     [[nodiscard]] auto param() const;
     auto param();
@@ -98,8 +102,7 @@ Vector3dual StateControl::angular_velocity() const {
 }
 
 auto StateControl::dynamics() const {
-    const Vector3d gravity(0, 0, 9.8);
-    auto linear_acc = f - plant.mass * gravity;
+    auto linear_acc = f + plant.mass * plant.gravity;
     auto angular_vel = angular_velocity();
     auto angular_acc = f.cross(r - p) - angular_vel.cross(plant.inertia * angular_vel);
     return (Matrix<dual, dynamics_dims, 1>() << r_dt, linear_acc, angular_acc, p_dt).finished();
@@ -121,6 +124,10 @@ auto StateControl::param() {
 Vector3dual StateControl::box() const {
     EulerAnglesZYXdual rotation(theta.z(), theta.y(), theta.x());
     return (rotation * (p - r) - plant.p).cwiseAbs() - plant.b;
+}
+
+dual StateControl::contact_product() const {
+    return f.norm() * p_dt.norm();
 }
 
 class Collocation {
@@ -211,6 +218,64 @@ public:
     }
 };
 
+class Friction {
+    const Plant& plant;
+
+public:
+    static constexpr unsigned output_dims = 1;
+    static constexpr unsigned frames = 1;
+
+    explicit Friction(const Plant& plant) : plant{plant} {}
+
+    template<typename Input, typename Output, typename Grad>
+    void operator()(unsigned index, const Input& input, Output& output, Grad& grad) {
+        StateControl state_control(input.col(index), plant);
+        auto func = [&state_control, this] {
+            auto cos = state_control.f.dot(plant.ground_normal) / state_control.f.norm();
+            return plant.friction - cos;
+        };
+
+        dual output_dual;
+        grad << gradient(func, wrt(state_control.param()), at(), output_dual);
+        output << static_cast<double>(output_dual);
+    }
+
+    template<typename Input, typename Output>
+    void operator()(unsigned index, const Input& input, Output& output) {
+        StateControl state_control(input.col(index), plant);
+        auto cos = state_control.f.dot(plant.ground_normal) / state_control.f.norm();
+        dual output_dual = plant.friction - cos;
+        output << static_cast<double>(output_dual);
+    }
+};
+
+class Contact {
+    const Plant& plant;
+
+public:
+    static constexpr unsigned output_dims = 1;
+    static constexpr unsigned frames = 1;
+
+    explicit Contact(const Plant& plant) : plant{plant} {}
+
+    template<typename Input, typename Output, typename Grad>
+    void operator()(unsigned index, const Input& input, Output& output, Grad& grad) {
+        StateControl state_control(input.col(index), plant);
+        auto func = [&state_control] { return state_control.contact_product(); };
+
+        dual output_dual;
+        grad << gradient(func, wrt(state_control.param()), at(), output_dual);
+        output << static_cast<double>(output_dual);
+    }
+
+    template<typename Input, typename Output>
+    void operator()(unsigned index, const Input& input, Output& output) {
+        StateControl state_control(input.col(index), plant);
+        dual output_dual = state_control.contact_product();
+        output << static_cast<double>(output_dual);
+    }
+};
+
 template<typename Func>
 void
 wrapper(unsigned output_dims, double* output, unsigned input_dims, const double* input, double* grad, void* data) {
@@ -246,6 +311,8 @@ int main() {
     opt.add_equality_mconstraint(wrapper<Collocation>, &plant, tol);
     opt.add_inequality_mconstraint(wrapper<JointLimit>, &plant, tol);
     opt.add_inequality_mconstraint(wrapper<Ground>, &plant, tol);
+    opt.add_inequality_mconstraint(wrapper<Friction>, &plant, tol);
+    opt.add_equality_mconstraint(wrapper<Contact>, &plant, tol);
 
     return 0;
 }
