@@ -48,26 +48,26 @@ constexpr double delta_seconds = 0.05;
 
 constexpr unsigned state_dims = 21;
 constexpr unsigned dynamics_dims = 12;
-constexpr unsigned boundary_dims = 6;
+constexpr unsigned boundary_dims = 9;
 
 struct Plant {
     Vector3d gravity = Vector3d(0.0, 0.0, -9.8);
-    double mass = 1.0;
+    double mass = 0.1;
     Matrix3d inertia = Matrix3d::Identity();
 
     Vector3d p = Vector3d(0.0, 0.0, -1.0);
-    Vector3d b = Vector3d(0.1, 0.1, 0.1);
+    Vector3d b = Vector3d(0.4, 0.4, 0.4);
 
-    double ground_height = 0;
+    double ground_height = 0.1;
     Vector3d ground_normal = Vector3d(0.0, 0.0, 1.0);
     double friction = 0.707;
 
     Vector3d init_pos = Vector3d(0.0, 0.0, 1.0);
     Vector3d init_vel = Vector3d::Zero();
-    Vector3d init_dir = Vector3d::Zero();
-    Vector3d final_pos = Vector3d(1.0, 0.0, 1.0);
+    Vector3d init_dir = Vector3d(M_PI_4, -M_PI_4, 0.0);
+    Vector3d final_pos = Vector3d(1.0, 0.0, 1.5);
     Vector3d final_vel = Vector3d::Zero();
-    Vector3d final_dir = Vector3d::Zero();
+    Vector3d final_dir = Vector3d(-M_PI_4, M_PI_4, M_PI_4);
 };
 
 struct StateControl {
@@ -143,8 +143,9 @@ auto StateControl::param() {
 
 Vector3dual StateControl::box() const {
     EulerAnglesZYXdual rotation(theta.z(), theta.y(), theta.x());
-    auto distance = (rotation * (p - r) - plant.p).cwiseAbs2();
-    return distance - plant.b.cwiseAbs2();
+    Vector3dual distance = (rotation * (p - r) - plant.p).cwiseAbs2();
+    Vector3dual box = plant.b.cwiseAbs2();
+    return distance - box;
 }
 
 dual StateControl::ground() const {
@@ -157,7 +158,7 @@ dual StateControl::friction() const {
 }
 
 dual StateControl::contact() const {
-    return f.squaredNorm() * p_dt.squaredNorm();
+    return f.z() * p_dt.x();
 }
 
 dual StateControl::energy() const {
@@ -167,15 +168,15 @@ dual StateControl::energy() const {
 VectorXdual StateControl::init_boundary() const {
     auto delta_pos = r - plant.init_pos;
     auto delta_vel = r_dt - plant.init_vel;
-    // auto delta_dir = theta - plant.init_dir;
-    return (VectorXdual(boundary_dims) << delta_pos, delta_vel).finished();
+    auto delta_dir = theta - plant.init_dir;
+    return (VectorXdual(boundary_dims) << delta_pos, delta_vel, delta_dir).finished();
 }
 
 VectorXdual StateControl::final_boundary() const {
     auto delta_pos = r - plant.final_pos;
     auto delta_vel = r_dt - plant.final_vel;
-    // auto delta_dir = theta - plant.final_dir;
-    return (VectorXdual(boundary_dims) << delta_pos, delta_vel).finished();
+    auto delta_dir = theta - plant.final_dir;
+    return (VectorXdual(boundary_dims) << delta_pos, delta_vel, delta_dir).finished();
 }
 
 template<typename Derived>
@@ -462,24 +463,41 @@ double rand_disturb(double min, double max) {
 }
 
 vector<double> init_guess(const Plant& plant, unsigned horizon) {
+    Vector3d init_p_pos = plant.init_pos + plant.p;
+    Vector3d final_p_pos = plant.final_pos + plant.p;
+
+    double step_cycle = 1.0;
+    double flight_rate = 0.5;
+
+    Vector3d flight_p_vel = (final_p_pos - init_p_pos) / (delta_seconds * horizon) / flight_rate;
+    Vector3d current_p_pos = init_p_pos;
+    Vector3d current_p_vel = flight_p_vel;
+
+    VectorXd init(state_dims), final(state_dims);
+    auto zero3 = Vector3d::Zero();
+    init << plant.init_pos, zero3, plant.init_dir, zero3, init_p_pos, flight_p_vel, zero3;
+    final << plant.final_pos, zero3, plant.final_dir, zero3, final_p_pos, flight_p_vel, zero3;
+
     vector<double> input(state_dims * horizon);
     Map<MatrixXd> matrix(input.data(), state_dims, horizon);
     for (unsigned i = 0; i < horizon; ++i) {
-        VectorXd init(state_dims), final(state_dims);
-        // Vector3d vel = (plant.final_pos - plant.init_pos) / (delta_seconds * horizon);
-        Vector3d vel = Vector3d::Zero();
+        double time = delta_seconds * i;
+        double time_in_cycle = time - (int) (time / step_cycle);
 
-        Vector3d init_p_pos = plant.init_pos + plant.p;
-        Vector3d final_p_pos = plant.final_pos + plant.p;
-        // Vector3d p_vel = (final_p_pos - init_p_pos) / (delta_seconds * horizon);
-        Vector3d p_vel = Vector3d::Zero();
+        VectorXd interpolate = init + i * (final - init) / (horizon - 1);
 
         Vector3d force = -plant.mass * plant.gravity;
-        // Vector3d force = Vector3d::Zero();
+        if (time_in_cycle / step_cycle > 1.0 - flight_rate) {
+            force = zero3;
+            current_p_vel = flight_p_vel;
+            current_p_pos += delta_seconds * current_p_vel;
+        } else
+            current_p_vel = zero3;
 
-        init << plant.init_pos, vel, plant.init_dir, Vector3d::Zero(), init_p_pos, p_vel, force;
-        final << plant.final_pos, vel, plant.final_dir, Vector3d::Zero(), final_p_pos, p_vel, force;
-        matrix.col(i) << init + i * (final - init) / (horizon - 1);
+        interpolate.segment<3>(12) << current_p_pos;
+        interpolate.segment<3>(15) << current_p_vel;
+        interpolate.tail(3) << force;
+        matrix.col(i) << interpolate;
     }
     // for (auto& x : input) x += rand_disturb(-0.001, 0.001);
     return input;
@@ -498,32 +516,10 @@ auto tol(unsigned horizon, double value = 0) {
 
 const IOFormat csv_format(Eigen::StreamPrecision, Eigen::DontAlignCols, ", ", "\n");
 
-int main() {
-    Plant plant;
-
-    unsigned horizon = 40;
-    nlopt::opt local_opt(nlopt::algorithm::LD_MMA, state_dims * horizon);
-    local_opt.set_ftol_abs(1e-4);
-    local_opt.set_ftol_rel(1e-2);
-    local_opt.set_xtol_abs(1e-4);
-    local_opt.set_xtol_rel(1e-2);
-
-    nlopt::opt opt(nlopt::algorithm::LD_SLSQP, state_dims * horizon);
-    opt.set_maxeval(100);
-    // opt.set_local_optimizer(local_opt);
-    opt.set_min_objective(energy, &plant);
-    opt.add_equality_mconstraint(wrapper<Collocation>, &plant, tol<Collocation>(horizon, 0.01));
-    opt.add_inequality_mconstraint(wrapper<JointLimit>, &plant, tol<JointLimit>(horizon, 0.01));
-    // opt.add_inequality_mconstraint(wrapper<Ground>, &plant, tol<Ground>(horizon, 0.01));
-    // opt.add_inequality_mconstraint(wrapper<Friction>, &plant, tol<Friction>(horizon));
-    // opt.add_equality_mconstraint(wrapper<Contact>, &plant, tol<Contact>(horizon));
-    opt.add_equality_mconstraint(init_boundary, &plant, vector<double>(boundary_dims, 0.01));
-    opt.add_equality_mconstraint(final_boundary, &plant, vector<double>(boundary_dims, 0.01));
-
-    auto x = init_guess(plant, horizon);
+void optimize(nlopt::opt& opt, vector<double>& x, double& f) {
+    auto horizon = x.size() / state_dims;
     Map<MatrixXd> matrix(x.data(), state_dims, horizon);
     cout << matrix << endl << endl;
-    double f;
 
     try {
         opt.optimize(x, f);
@@ -533,14 +529,48 @@ int main() {
 
     cout << matrix << endl;
     cout << f << endl;
+    cout << opt.get_numevals() << endl;
+}
 
-    std::fstream fs("output.txt", std::ios::out);
+void save(const std::string& filename, const vector<double>& x) {
+    auto horizon = x.size() / state_dims;
+    Map<const MatrixXd> matrix(x.data(), state_dims, horizon);
+
+    std::fstream fs(filename, std::ios::out);
     for (int i = 0; i < matrix.cols(); ++i) {
         fs << i;
         if (i != matrix.cols() - 1) fs << ", ";
         else fs << endl;
     }
     fs << matrix.format(csv_format) << endl;
+}
+
+int main() {
+    Plant plant;
+
+    unsigned horizon = 40;
+
+    nlopt::opt opt(nlopt::algorithm::LD_SLSQP, state_dims * horizon);
+    opt.set_maxeval(100);
+    opt.set_min_objective(energy, &plant);
+    opt.add_equality_mconstraint(wrapper<Collocation>, &plant, tol<Collocation>(horizon));
+    // opt.add_inequality_mconstraint(wrapper<JointLimit>, &plant, tol<JointLimit>(horizon));
+    // opt.add_inequality_mconstraint(wrapper<Ground>, &plant, tol<Ground>(horizon, 0.01));
+    // opt.add_inequality_mconstraint(wrapper<Friction>, &plant, tol<Friction>(horizon));
+    opt.add_equality_mconstraint(wrapper<Contact>, &plant, tol<Contact>(horizon));
+    opt.add_equality_mconstraint(init_boundary, &plant, vector<double>(boundary_dims, 0.01));
+    opt.add_equality_mconstraint(final_boundary, &plant, vector<double>(boundary_dims, 0.01));
+
+    auto x = init_guess(plant, horizon);
+    double f;
+    optimize(opt, x, f);
+
+    opt.add_inequality_mconstraint(wrapper<JointLimit>, &plant, tol<JointLimit>(horizon));
+    opt.add_inequality_mconstraint(wrapper<Ground>, &plant, tol<Ground>(horizon, 0.01));
+
+    optimize(opt, x, f);
+
+    save("output.txt", x);
 
     return 0;
 }
